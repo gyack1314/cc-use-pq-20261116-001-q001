@@ -69,10 +69,43 @@ def run() -> dict:
         check = required(client.get("/reports/after/verify"))
         if not check["matches"]:
             raise RuntimeError("Frozen report verification failed")
+        # 来源版本更正：类别改判，责任与期限重算，原办理记录进入争议。
+        required(client.put("/routes/noise?actor=analyst", json={
+            "category": "noise", "department": "noise_team", "priority": 7,
+            "response_hours": 12, "resolution_hours": 48}))
+        correction = required(client.post(f"/cases/{first}/corrections", json={
+            "correction_key": "fix-1", "expected_version": 3,
+            "submitted_at": "2026-01-05T00:00:00Z",
+            "effective_at": "2026-01-01T08:00:00Z", "source": "hotline",
+            "category": "noise", "note": "Source reclassified the appeal"}))
+        if correction["case"]["department"] != "noise_team":
+            raise RuntimeError("Correction did not re-determine responsibility")
+        if not correction["disputes"]:
+            raise RuntimeError("Prior handling under another owner must open a dispute")
+        archived = required(client.get("/reports/after"))
+        if not archived["needs_review"]:
+            raise RuntimeError("Archived report affected by correction must need review")
+        if required(client.get("/reports/after/verify"))["matches"] is not True:
+            raise RuntimeError("Archived figures must remain reproducible")
+        reanalysis = required(client.get("/reports/after/reanalyze"))
+        if reanalysis["current_totals"]["accepted"] != 2:
+            raise RuntimeError("Correction must not double-count the case")
+        if not reanalysis["changed_groups"]:
+            raise RuntimeError("Reanalysis must explain the grouping change")
+        duplicate = required(client.post(f"/cases/{first}/corrections", json={
+            "correction_key": "fix-1", "expected_version": 3,
+            "submitted_at": "2026-01-05T00:00:00Z",
+            "effective_at": "2026-01-01T08:00:00Z", "source": "hotline",
+            "category": "noise", "note": "Source reclassified the appeal"}))
+        if not duplicate["replayed"]:
+            raise RuntimeError("Duplicate correction must be idempotent")
         return {"accepted": imported["imported_count"],
                 "closed_as_of_later_report": after["body"]["totals"]["closed"],
                 "historic_closed": before["body"]["totals"]["closed"],
-                "quality_issues": quality["issue_count"], "report_verified": check["matches"]}
+                "quality_issues": quality["issue_count"], "report_verified": check["matches"],
+                "correction_disputes": len(correction["disputes"]),
+                "review_queue": required(client.get("/reports/review-queue"))["count"],
+                "reanalysis_group_changes": len(reanalysis["changed_groups"])}
 
 if __name__ == "__main__":
     print(json.dumps(run(), ensure_ascii=False, sort_keys=True))

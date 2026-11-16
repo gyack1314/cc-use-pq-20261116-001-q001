@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS cases (
     status TEXT NOT NULL, resolution TEXT,
     first_response_at TEXT, last_event_at TEXT NOT NULL,
     version INTEGER NOT NULL DEFAULT 1, created_sequence INTEGER NOT NULL,
+    correction_count INTEGER NOT NULL DEFAULT 0,
+    corrected_at TEXT, dispute_count INTEGER NOT NULL DEFAULT 0,
     UNIQUE(source, external_id)
 );
 CREATE INDEX IF NOT EXISTS cases_grid_status ON cases(grid_id,status);
@@ -59,12 +61,46 @@ CREATE TABLE IF NOT EXISTS reports (
     report_key TEXT PRIMARY KEY, request_digest TEXT NOT NULL,
     as_of TEXT NOT NULL, watermark INTEGER NOT NULL,
     group_by TEXT NOT NULL, district TEXT, category TEXT,
-    body_json TEXT NOT NULL, created_at TEXT NOT NULL
+    body_json TEXT NOT NULL, created_at TEXT NOT NULL,
+    view TEXT NOT NULL DEFAULT 'as_known',
+    needs_review INTEGER NOT NULL DEFAULT 0, review_marked_sequence INTEGER
 );
 CREATE TABLE IF NOT EXISTS policy_changes (
     change_id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
     item_key TEXT NOT NULL, revision INTEGER NOT NULL,
     old_json TEXT, new_json TEXT NOT NULL, sequence INTEGER NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS case_corrections (
+    correction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id INTEGER NOT NULL REFERENCES cases(case_id),
+    correction_key TEXT NOT NULL,
+    expected_version INTEGER NOT NULL,
+    case_version INTEGER NOT NULL,
+    submitted_at TEXT NOT NULL, effective_at TEXT NOT NULL,
+    source TEXT NOT NULL,
+    old_json TEXT NOT NULL, new_json TEXT NOT NULL,
+    route_revision INTEGER NOT NULL,
+    response_due TEXT NOT NULL, resolution_due TEXT NOT NULL,
+    sequence INTEGER NOT NULL UNIQUE, digest TEXT NOT NULL,
+    UNIQUE(case_id,correction_key)
+);
+CREATE INDEX IF NOT EXISTS corrections_case ON case_corrections(case_id,effective_at);
+CREATE TABLE IF NOT EXISTS case_disputes (
+    dispute_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id INTEGER NOT NULL REFERENCES cases(case_id),
+    correction_id INTEGER NOT NULL REFERENCES case_corrections(correction_id),
+    event_id INTEGER NOT NULL REFERENCES events(event_id),
+    reason TEXT NOT NULL, detail TEXT NOT NULL,
+    created_sequence INTEGER NOT NULL,
+    UNIQUE(case_id,correction_id,event_id,reason)
+);
+CREATE INDEX IF NOT EXISTS disputes_case ON case_disputes(case_id);
+CREATE TABLE IF NOT EXISTS report_reviews (
+    report_key TEXT NOT NULL REFERENCES reports(report_key),
+    case_id INTEGER NOT NULL REFERENCES cases(case_id),
+    correction_id INTEGER NOT NULL REFERENCES case_corrections(correction_id),
+    marked_sequence INTEGER NOT NULL,
+    PRIMARY KEY (report_key, case_id, correction_id)
 );
 """
 
@@ -84,6 +120,25 @@ class Store:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.connection() as db:
             db.executescript(SCHEMA)
+            self._migrate(db)
+
+    @staticmethod
+    def _migrate(db: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(cases)")}
+        for name, ddl in (
+            ("correction_count", "ALTER TABLE cases ADD COLUMN correction_count INTEGER NOT NULL DEFAULT 0"),
+            ("corrected_at", "ALTER TABLE cases ADD COLUMN corrected_at TEXT"),
+            ("dispute_count", "ALTER TABLE cases ADD COLUMN dispute_count INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in columns:
+                db.execute(ddl)
+        report_columns = {row["name"] for row in db.execute("PRAGMA table_info(reports)")}
+        if "needs_review" not in report_columns:
+            db.execute("ALTER TABLE reports ADD COLUMN needs_review INTEGER NOT NULL DEFAULT 0")
+        if "review_marked_sequence" not in report_columns:
+            db.execute("ALTER TABLE reports ADD COLUMN review_marked_sequence INTEGER")
+        if "view" not in report_columns:
+            db.execute("ALTER TABLE reports ADD COLUMN view TEXT NOT NULL DEFAULT 'as_known'")
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
@@ -212,7 +267,8 @@ class Store:
     @staticmethod
     def table_counts(db: sqlite3.Connection) -> dict:
         return {name: int(db.execute("SELECT COUNT(*) FROM " + name).fetchone()[0])
-                for name in ("grids", "route_rules", "batches", "cases", "events", "reports")}
+                for name in ("grids", "route_rules", "batches", "cases", "events", "reports",
+                             "case_corrections", "case_disputes")}
 
     @staticmethod
     def journal_span(db: sqlite3.Connection, start: int, end: int) -> list[dict]:
@@ -231,3 +287,72 @@ class Store:
             "SELECT case_id,source,external_id,grid_id,category,accepted_at,created_sequence "
             "FROM cases WHERE created_sequence BETWEEN ? AND ? ORDER BY created_sequence",
             (batch["sequence_start"], batch["sequence_end"]))]
+
+    @staticmethod
+    def correction_by_key(db: sqlite3.Connection, case_id: int,
+                          correction_key: str) -> dict | None:
+        return row(db.execute(
+            "SELECT * FROM case_corrections WHERE case_id=? AND correction_key=?",
+            (case_id, correction_key)).fetchone())
+
+    @staticmethod
+    def corrections(db: sqlite3.Connection, case_id: int,
+                    watermark: int | None = None) -> list[dict]:
+        if watermark is None:
+            sql = "SELECT * FROM case_corrections WHERE case_id=? ORDER BY correction_id"
+            params: tuple = (case_id,)
+        else:
+            sql = ("SELECT * FROM case_corrections WHERE case_id=? AND sequence<=? "
+                   "ORDER BY correction_id")
+            params = (case_id, watermark)
+        return [dict(item) for item in db.execute(sql, params)]
+    @staticmethod
+    def latest_correction(db: sqlite3.Connection, case_id: int,
+                          watermark: int | None = None) -> dict | None:
+        items = Store.corrections(db, case_id, watermark)
+        return items[-1] if items else None
+
+    @staticmethod
+    def disputes(db: sqlite3.Connection, case_id: int,
+                 watermark: int | None = None) -> list[dict]:
+        if watermark is None:
+            sql = "SELECT * FROM case_disputes WHERE case_id=? ORDER BY dispute_id"
+            params: tuple = (case_id,)
+        else:
+            sql = ("SELECT * FROM case_disputes WHERE case_id=? AND created_sequence<=? "
+                   "ORDER BY dispute_id")
+            params = (case_id, watermark)
+        return [dict(item) for item in db.execute(sql, params)]
+
+    @staticmethod
+    def add_dispute(db: sqlite3.Connection, case_id: int, correction_id: int,
+                    event_id: int, reason: str, detail: str, sequence: int) -> None:
+        db.execute(
+            "INSERT OR IGNORE INTO case_disputes(case_id,correction_id,event_id,reason,"
+            "detail,created_sequence) VALUES(?,?,?,?,?,?)",
+            (case_id, correction_id, event_id, reason, detail, sequence))
+
+    @staticmethod
+    def review_rows(db: sqlite3.Connection, report_key: str | None = None) -> list[dict]:
+        if report_key is None:
+            sql = "SELECT * FROM report_reviews ORDER BY report_key"
+            params: tuple = ()
+        else:
+            sql = "SELECT * FROM report_reviews WHERE report_key=? ORDER BY correction_id"
+            params = (report_key,)
+        return [dict(item) for item in db.execute(sql, params)]
+
+    @staticmethod
+    def mark_report_review(db: sqlite3.Connection, report_key: str, case_id: int,
+                           correction_id: int, sequence: int) -> None:
+        db.execute(
+            "INSERT OR IGNORE INTO report_reviews(report_key,case_id,correction_id,"
+            "marked_sequence) VALUES(?,?,?,?)",
+            (report_key, case_id, correction_id, sequence))
+        db.execute(
+            "UPDATE reports SET needs_review=1, review_marked_sequence=? WHERE report_key=?",
+            (sequence, report_key))
+
+    @staticmethod
+    def correction_count(db: sqlite3.Connection) -> int:
+        return int(db.execute("SELECT COUNT(*) FROM case_corrections").fetchone()[0])

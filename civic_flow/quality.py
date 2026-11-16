@@ -27,10 +27,23 @@ class QualityService:
             batches = [dict(row) for row in db.execute("SELECT * FROM batches ORDER BY batch_key")]
             cases = [dict(row) for row in db.execute("SELECT * FROM cases ORDER BY case_id")]
             events = [dict(row) for row in db.execute("SELECT * FROM events ORDER BY event_id")]
+            corrections = [dict(row) for row in db.execute(
+                "SELECT * FROM case_corrections ORDER BY correction_id")]
+            disputes = [dict(row) for row in db.execute(
+                "SELECT * FROM case_disputes ORDER BY dispute_id")]
             reports = [dict(row) for row in db.execute("SELECT * FROM reports ORDER BY report_key")]
             for case in cases:
                 key = str(case["case_id"])
-                if case["accepted_at"] > case["last_event_at"]:
+                case_events = [row for row in events if row["case_id"] == case["case_id"]]
+                case_corrections = [row for row in corrections
+                                    if row["case_id"] == case["case_id"]]
+                stored_disputes = [row for row in disputes if row["case_id"] == case["case_id"]]
+                dispute_reasons = {row["reason"] for row in stored_disputes}
+                disputed_event_ids = {row["event_id"] for row in stored_disputes}
+                # 更正把受理时间推后、原办理记录进入争议时，当前行出现时间倒置是预期结果，
+                # 不能当作数据损坏；真正的损坏仍由争议登记与计数核对兜底。
+                if case["accepted_at"] > case["last_event_at"] and \
+                        "TIME_BEFORE_ACCEPTANCE" not in dispute_reasons:
                     issues.append(self._issue("TIME_REVERSED", "case", key,
                                               "Last event predates acceptance"))
                 if case["response_due"] > case["resolution_due"]:
@@ -45,15 +58,23 @@ class QualityService:
                 if case["status"] != "closed" and case["resolution"]:
                     issues.append(self._issue("OPEN_WITH_RESOLUTION", "case", key,
                                               "Open case retains closure value"))
-                case_events = [row for row in events if row["case_id"] == case["case_id"]]
-                if len(case_events) + 1 != case["version"]:
+                if len(case_events) + len(case_corrections) + 1 != case["version"]:
                     issues.append(self._issue("VERSION_GAP", "case", key,
-                                              "Event count differs from current version"))
+                                              "Event and correction count differs from current version"))
+                # 事件与更正各自占用一个案件版本；合并后须恰好覆盖 2..version，无重复无缺口。
                 expected_versions = list(range(2, case["version"] + 1))
-                actual_versions = sorted(row["case_version"] for row in case_events)
+                actual_versions = sorted(
+                    [row["case_version"] for row in case_events]
+                    + [row["case_version"] for row in case_corrections])
                 if actual_versions != expected_versions:
                     issues.append(self._issue("EVENT_VERSION_GAP", "case", key,
-                                              "Event sequence is not contiguous"))
+                                              "Event/correction sequence is not contiguous"))
+                if case["dispute_count"] != len(disputed_event_ids):
+                    issues.append(self._issue("DISPUTE_COUNT_MISMATCH", "case", key,
+                                              "Dispute marker diverges from dispute records"))
+                if case["correction_count"] != len(case_corrections):
+                    issues.append(self._issue("CORRECTION_COUNT_MISMATCH", "case", key,
+                                              "Correction marker diverges from correction records"))
                 if not db.execute("SELECT 1 FROM journal WHERE sequence=?",
                                   (case["created_sequence"],)).fetchone():
                     issues.append(self._issue("MISSING_JOURNAL", "case", key,
@@ -63,6 +84,18 @@ class QualityService:
                                   (event["event_sequence"],)).fetchone():
                     issues.append(self._issue("MISSING_JOURNAL", "event", str(event["event_id"]),
                                               "Event has no journal entry"))
+            for correction in corrections:
+                if not db.execute("SELECT 1 FROM journal WHERE sequence=?",
+                                  (correction["sequence"],)).fetchone():
+                    issues.append(self._issue("MISSING_JOURNAL", "correction",
+                                              str(correction["correction_id"]),
+                                              "Correction has no journal entry"))
+            for dispute in disputes:
+                if not db.execute("SELECT 1 FROM journal WHERE sequence=?",
+                                  (dispute["created_sequence"],)).fetchone():
+                    issues.append(self._issue("MISSING_JOURNAL", "dispute",
+                                              str(dispute["dispute_id"]),
+                                              "Dispute has no journal entry"))
             for batch in batches:
                 count = sum(batch["sequence_start"] <= case["created_sequence"] <=
                             batch["sequence_end"] for case in cases)
@@ -73,10 +106,16 @@ class QualityService:
                 if report["watermark"] > watermark:
                     issues.append(self._issue("FUTURE_WATERMARK", "report", report["report_key"],
                                               "Report references uncommitted journal sequence"))
+                review_rows = self.store.review_rows(db, report["report_key"])
+                if bool(report["needs_review"]) != bool(review_rows):
+                    issues.append(self._issue("REVIEW_FLAG_MISMATCH", "report",
+                                              report["report_key"],
+                                              "Review flag diverges from review records"))
             totals = self.metrics.calculate(db, as_of=as_of, group_by="district", watermark=watermark)
             return {"as_of": stamp, "watermark": watermark, "counts": {
                 "batches": len(batches), "cases": len(cases), "events": len(events),
-                "reports": len(reports)}, "issue_count": len(issues),
+                "reports": len(reports), "corrections": len(corrections),
+                "disputes": len(disputes)}, "issue_count": len(issues),
                 "issues": issues[:limit], "truncated": len(issues) > limit,
                 "metrics_acceptance_count": totals["totals"]["accepted"]}
 

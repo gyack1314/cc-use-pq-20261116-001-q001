@@ -17,6 +17,7 @@ class Route:
     route_revision: int
     response_due: str
     resolution_due: str
+    accepted_at: str = ""
 
 class RoutingService:
     def __init__(self, store: Store):
@@ -79,7 +80,8 @@ class RoutingService:
                               {"category": category})
         return Route(grid_id, grid["district"], category, rule["department"],
                      rule["revision"], utc(accepted_at + timedelta(hours=rule["response_hours"])),
-                     utc(accepted_at + timedelta(hours=rule["resolution_hours"])))
+                     utc(accepted_at + timedelta(hours=rule["resolution_hours"])),
+                     utc(accepted_at))
 
     def list_grids(self) -> list[dict]:
         with self.store.connection() as db:

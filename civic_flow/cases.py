@@ -86,6 +86,8 @@ class CaseService:
             case = self.store.case(db, case_id)
             if history:
                 case["events"] = self.store.events(db, case_id)
+                case["corrections"] = self.store.corrections(db, case_id)
+                case["disputes"] = self.store.disputes(db, case_id)
             return case
 
     def list(self, district: str | None = None, category: str | None = None,
@@ -111,12 +113,27 @@ class CaseService:
         with self.store.connection() as db:
             case = self.store.case(db, case_id)
             events = self.store.events(db, case_id)
+            corrections = self.store.corrections(db, case_id)
+            disputes = self.store.disputes(db, case_id)
+            disputed_ids = {row["event_id"] for row in disputes}
+            timeline = [{"version": 1, "kind": "accepted", "at": case["accepted_at"],
+                         "department": case["initial_department"],
+                         "sequence": case["created_sequence"]}]
+            timeline += [{"version": item["case_version"], "kind": item["kind"],
+                          "at": item["occurred_at"], "department": item["department"],
+                          "sequence": item["event_sequence"],
+                          "disputed": item["event_id"] in disputed_ids} for item in events]
+            correction_marks = [{"version": item["case_version"], "kind": "corrected",
+                                 "at": item["submitted_at"], "effective_at": item["effective_at"],
+                                 "correction_key": item["correction_key"],
+                                 "source": item["source"], "sequence": item["sequence"]}
+                                for item in corrections]
             return {"case_id": case_id, "accepted_at": case["accepted_at"],
                     "initial_department": case["initial_department"],
                     "current_department": case["department"], "current_status": case["status"],
-                    "timeline": [{"version": 1, "kind": "accepted", "at": case["accepted_at"],
-                                  "department": case["initial_department"],
-                                  "sequence": case["created_sequence"]}]
-                    + [{"version": item["case_version"], "kind": item["kind"],
-                        "at": item["occurred_at"], "department": item["department"],
-                        "sequence": item["event_sequence"]} for item in events]}
+                    "correction_count": case["correction_count"],
+                    "dispute_count": case["dispute_count"],
+                    "timeline": timeline, "corrections": correction_marks,
+                    "disputes": [{"event_id": row["event_id"], "reason": row["reason"],
+                                  "detail": row["detail"], "correction_id": row["correction_id"]}
+                                 for row in disputes]}

@@ -38,7 +38,8 @@ class Resolution(str, Enum):
     OUT_OF_SCOPE = "out_of_scope"
 
 class AwareModel(BaseModel):
-    @field_validator("occurred_at", "submitted_at", "as_of", check_fields=False)
+    @field_validator("occurred_at", "submitted_at", "as_of", "effective_at", "accepted_at",
+                     check_fields=False)
     @classmethod
     def aware(cls, value: datetime) -> datetime:
         if value.tzinfo is None:
@@ -107,16 +108,49 @@ class EventInput(AwareModel):
             raise ValueError("Resolution only applies to closure")
         return self
 
+class CorrectionInput(AwareModel):
+    correction_key: str = Field(min_length=1, max_length=100)
+    expected_version: int = Field(ge=1)
+    submitted_at: datetime
+    effective_at: datetime
+    source: str = Field(min_length=1, max_length=40)
+    grid_id: str | None = Field(default=None, min_length=1, max_length=80)
+    category: str | None = Field(default=None, min_length=1, max_length=80)
+    accepted_at: datetime | None = None
+    note: str = Field(min_length=1, max_length=500)
+
+    @field_validator("correction_key", "source")
+    @classmethod
+    def clean_key(cls, value: str) -> str:
+        if value != value.strip() or any(ord(c) < 32 for c in value):
+            raise ValueError("Identifier must be trimmed and printable")
+        return value
+
+    @model_validator(mode="after")
+    def shape(self):
+        if not any(value is not None for value in (self.grid_id, self.category, self.accepted_at)):
+            raise ValueError("Correction must change grid, category or acceptance time")
+        return self
+
+
 class ReportInput(AwareModel):
     report_key: str = Field(min_length=1, max_length=100)
     as_of: datetime
     district: str | None = None
     category: str | None = None
     group_by: str = "district"
+    view: str = "as_known"
 
     @field_validator("group_by")
     @classmethod
     def grouping(cls, value: str) -> str:
         if value not in {"district", "grid", "category", "department"}:
             raise ValueError("Unsupported grouping")
+        return value
+
+    @field_validator("view")
+    @classmethod
+    def view_check(cls, value: str) -> str:
+        if value not in {"as_known", "current"}:
+            raise ValueError("View must be as_known or current")
         return value

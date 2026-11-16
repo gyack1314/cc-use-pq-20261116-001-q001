@@ -9,8 +9,9 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from .cases import CaseService
-from .contracts import (BatchInput, DomainError, EventInput, GridInput,
+from .contracts import (BatchInput, CorrectionInput, DomainError, EventInput, GridInput,
                         ReportInput, RouteRuleInput)
+from .corrections import CorrectionService
 from .ingest import IntakeService
 from .metrics import MetricsService
 from .quality import QualityService
@@ -30,6 +31,7 @@ def create_app(path: str | Path | None = None) -> FastAPI:
     routes = RoutingService(store)
     intake = IntakeService(store)
     cases = CaseService(store)
+    corrections = CorrectionService(store)
     metrics = MetricsService(store)
     reports = ReportService(store)
     quality = QualityService(store)
@@ -118,9 +120,25 @@ def create_app(path: str | Path | None = None) -> FastAPI:
     def case_timeline(case_id: int):
         return cases.timeline(case_id)
 
+    @app.post("/cases/{case_id}/corrections")
+    def submit_correction(case_id: int, body: CorrectionInput):
+        return corrections.submit(case_id, body)
+
+    @app.get("/cases/{case_id}/corrections")
+    def case_corrections(case_id: int):
+        return corrections.list_corrections(case_id)
+
+    @app.get("/cases/{case_id}/disputes")
+    def case_disputes(case_id: int):
+        return corrections.list_disputes(case_id)
+
+    @app.get("/disputes")
+    def all_disputes():
+        return corrections.list_disputes()
+
     @app.get("/cases/{case_id}/at")
-    def case_at(case_id: int, as_of: datetime):
-        return metrics.case_at(case_id, as_of)
+    def case_at(case_id: int, as_of: datetime, view: str = "as_known"):
+        return metrics.case_at(case_id, as_of, view=view)
 
     @app.get("/audit")
     def audit(after: int = 0, limit: int = 100):
@@ -128,9 +146,10 @@ def create_app(path: str | Path | None = None) -> FastAPI:
 
     @app.get("/metrics")
     def metric_preview(as_of: datetime, group_by: str = "district", district: str | None = None,
-                       category: str | None = None, include_cases: bool = False):
+                       category: str | None = None, include_cases: bool = False,
+                       view: str = "as_known"):
         return metrics.preview(as_of=as_of, group_by=group_by, district=district,
-                               category=category, include_cases=include_cases)
+                               category=category, include_cases=include_cases, view=view)
 
     @app.post("/reports")
     def create_report(body: ReportInput):
@@ -140,6 +159,10 @@ def create_app(path: str | Path | None = None) -> FastAPI:
     def list_reports(after: str = "", limit: int = 50):
         return reports.list(after, limit)
 
+    @app.get("/reports/review-queue")
+    def report_review_queue():
+        return corrections.review_queue()
+
     @app.get("/reports/{key}")
     def get_report(key: str):
         return reports.get(key)
@@ -147,6 +170,10 @@ def create_app(path: str | Path | None = None) -> FastAPI:
     @app.get("/reports/{key}/verify")
     def verify_report(key: str):
         return reports.verify(key)
+
+    @app.get("/reports/{key}/reanalyze")
+    def reanalyze_report(key: str):
+        return reports.reanalyze(key)
 
     @app.get("/reports/{first}/compare/{second}")
     def compare_reports(first: str, second: str):
